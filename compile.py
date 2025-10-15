@@ -133,7 +133,10 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
     indent2 = "    "
     indent3 = "      "
 
+    print(f"/** {expr} */")
     print("template<typename index_t, typename value_t>")
+    if not compute:
+        func_name += "_precompute"
     print(f"void {func_name}(")
 
     # For each argument in args, print a const SparseVector& with an underscore added
@@ -145,7 +148,7 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
         print(f"{indent1}SparseVector<index_t, value_t> &output)\n{{")
     else:
         # array of counts. TODO: global atomic?
-        print(f"{indent1}index_t *nnzs) {{")
+        print(f"{indent1}index_t *nnzs)\n{{")
         # local count
         print(f"{indent1}index_t nnz_count = 0;")
 
@@ -168,7 +171,7 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
         terms = [f"(idx_{s} < end_{s})" for s in iters]
         while_cond = " && ".join(terms)
 
-        print(f"{indent1}while({while_cond}) {{")
+        print(f"\n{indent1}while({while_cond}) {{")
 
         for vec in iters:
             print(f"{indent2}index_t crd_{vec} = _{vec}.indices[idx_{vec}];")
@@ -178,6 +181,7 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
         for vec in iters[1:]:
             min_expr = f"std::min({min_expr}, crd_{vec})"
         print(f"{indent2}index_t crd = {min_expr};")
+        print()
 
         # Now perform casework. Consider this node and all children.
         compile_if(point, True)
@@ -185,6 +189,8 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
         for child in point.children:
             if child.expr is not None:
                 compile_if(child, False)
+        
+        print(f"{indent2}}}")
 
         # Now step forward iterators
         for vec in iters:
@@ -202,7 +208,7 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
         if_cond = " && ".join(terms)
 
         if not first:
-            print(f"{indent2}else if ({if_cond}) {{")
+            print(f"{indent2}}} else if ({if_cond}) {{")
         else:
             print(f"{indent2}if ({if_cond}) {{")
 
@@ -213,8 +219,6 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
             for vec in iters:
                 print(f"{indent3}value_t {vec} = _{vec}.values[idx_{vec}];")
             print(f"{indent3}output.values[idx_output++] = {point.expr};")
-
-        print(f"{indent2}}}")
 
 
     compile_loop(lattice)
@@ -232,10 +236,25 @@ if __name__ == "__main__":
     c = Vector("c")
 
     expr = a * b
-    compile(expr, "mul_nnz_count", False)
-    compile(expr, "mul_compute", True)
+    compile(expr, "mul", False)
+    print()
+    compile(expr, "mul", True)
+    print()
+
+    expr = a + b
+    compile(expr, "add", False)
+    print()
+    compile(expr, "add", True)
+    print()
 
     expr = (a + b) * c
-    compile(expr, "plus_mul_nnz_count", False)
-    compile(expr, "plus_mul_compute", True)
+    compile(expr, "plus_mul", False)
+    print()
+    compile(expr, "plus_mul", True)
+    print()
 
+    expr = (a * b) + c
+    compile(expr, "fma", False)
+    print()
+    compile(expr, "fma", True)
+    print()
