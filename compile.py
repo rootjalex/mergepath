@@ -170,7 +170,7 @@ def compile(expr : Expr, lb : List[str], func_name : str, compute : bool = True)
 
     # First upper bounds
     count = 0
-    print(f"{indent1}index_t min_crd = _{vectors[0]}.length;")
+    print(f"{indent1}index_t min_crd = (tid == 0) ? 0 : _{vectors[0]}.length;")
     for vec in vectors:
         if vec in lb:
             # Lookup this vector's start point up in mergepath_partitions
@@ -179,11 +179,12 @@ def compile(expr : Expr, lb : List[str], func_name : str, compute : bool = True)
             print(f"{indent1}idx_{vec} = mergepath_partitions[{count} * n_threads + tid];")
             print(f"{indent1}min_crd = std::min(min_crd, _{vec}.indices[idx_{vec}]);")
             count += 1
+    print()
 
     print()
 
     # Now upper bounds
-    print(f"{indent1}index_t max_crd = 0;")
+    print(f"{indent1}index_t max_crd = (tid != (n_threads - 1)) ? 0 : _{vectors[0]}.length - 1;")
     print(f"{indent1}if (tid != (n_threads - 1)) {{")
     count = 0
     for vec in vectors:
@@ -192,9 +193,6 @@ def compile(expr : Expr, lb : List[str], func_name : str, compute : bool = True)
             print(f"{indent2}end_{vec} = mergepath_partitions[{count} * n_threads + tid + 1];")
             print(f"{indent2}max_crd = std::max(max_crd, _{vec}.indices[end_{vec}]);")
             count += 1
-    print(f"{indent1}}} else {{")
-    # Otherwise just _{vec}.nnz - 1
-    print(f"{indent2}max_crd = _{vectors[0]}.length - 1;")
     print(f"{indent1}}}")
     print()
 
@@ -203,8 +201,8 @@ def compile(expr : Expr, lb : List[str], func_name : str, compute : bool = True)
         if vec not in lb:
             # Binary search for this vector's start and end points
             # TODO: might need clamping to 0 and nnz, respectively
-            print(f"{indent1}idx_{vec} = lower_bound(_{vec}, min_crd);")
-            print(f"{indent1}end_{vec} = upper_bound(_{vec}, max_crd);")
+            print(f"{indent1}idx_{vec} = upper_bound(_{vec}, min_crd);")
+            print(f"{indent1}end_{vec} = lower_bound(_{vec}, max_crd);")
     if compute:
         print(f"{indent1}index_t idx_output = output_offset[tid];")
 
@@ -291,4 +289,10 @@ if __name__ == "__main__":
     compile(expr, {"a", "b"}, "mul_lb_ab", False)
     print()
     compile(expr, {"a", "b"}, "mul_lb_ab", True)
+    print()
+
+    expr = a + b
+    compile(expr, {"a"}, "add_lb_a", False)
+    print()
+    compile(expr, {"a"}, "add_lb_a", True)
     print()
