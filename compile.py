@@ -1,5 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import List
 
 @dataclass(frozen=True)
 class Expr:
@@ -126,7 +127,8 @@ def get_sorted_args(expr : Expr):
     return vectors 
 
 # Vector expression to compile, and flag to enable compute or counting
-def compile(expr : Expr, func_name : str, compute : bool = True):
+# lb is a list of the vectors to load balance with respect to
+def compile(expr : Expr, lb : List[str], func_name : str, compute : bool = True):
     vectors = get_sorted_args(expr)
 
     indent1 = "  "
@@ -138,6 +140,10 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
     if not compute:
         func_name += "_precompute"
     print(f"void {func_name}(")
+
+    print(f"{indent1}const index_t *mergepath_partitions,")
+    if compute:
+        print(f"{indent1}const index_t *output_offset,")
 
     # For each argument in args, print a const SparseVector& with an underscore added
     for vec in vectors:
@@ -152,14 +158,55 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
         # local count
         print(f"{indent1}index_t nnz_count = 0;")
 
-    # TODO: this is where the load balancing strategy should go!
+    print(f"{indent1}const int n_threads = gridDim.x * blockDim.x;")
+    print(f"{indent1}const int tid = blockIdx.x * blockDim.x + threadIdx.x;")
+    print()
+
     # First, declare start and end indices
     for vec in vectors:
-        print(f"{indent1}index_t idx_{vec} = 0, end_{vec} = _{vec}.nnz;")
+        print(f"{indent1}index_t idx_{vec} = 0, end_{vec} = _{vec}.nnz - 1;")
 
-    # TODO: for parallel, need some other way of computing output iterator.
+    # Now get bounds via load balancing.
+
+    # First upper bounds
+    count = 0
+    print(f"{indent1}index_t min_crd = _{vectors[0]}.length;")
+    for vec in vectors:
+        if vec in lb:
+            # Lookup this vector's start point up in mergepath_partitions
+            # TODO: this copy's Atharva's code, but I think we can reorder
+            # the partitions array to make these loads better.
+            print(f"{indent1}idx_{vec} = mergepath_partitions[{count} * n_threads + tid];")
+            print(f"{indent1}min_crd = std::min(min_crd, _{vec}.indices[idx_{vec}]);")
+            count += 1
+
+    print()
+
+    # Now upper bounds
+    print(f"{indent1}index_t max_crd = 0;")
+    print(f"{indent1}if (tid != (n_threads - 1)) {{")
+    count = 0
+    for vec in vectors:
+        if vec in lb:
+            # Lookup this vector's end point up in mergepath_partitions
+            print(f"{indent2}end_{vec} = mergepath_partitions[{count} * n_threads + tid + 1];")
+            print(f"{indent2}max_crd = std::max(max_crd, _{vec}.indices[end_{vec}]);")
+            count += 1
+    print(f"{indent1}}} else {{")
+    # Otherwise just _{vec}.nnz - 1
+    print(f"{indent2}max_crd = _{vectors[0]}.length - 1;")
+    print(f"{indent1}}}")
+    print()
+
+    # Lookup ranges for non-load balanced vectors
+    for vec in vectors:
+        if vec not in lb:
+            # Binary search for this vector's start and end points
+            # TODO: might need clamping to 0 and nnz, respectively
+            print(f"{indent1}idx_{vec} = lower_bound(_{vec}, min_crd);")
+            print(f"{indent1}end_{vec} = upper_bound(_{vec}, max_crd);")
     if compute:
-        print(f"{indent1}index_t idx_output = 0;")
+        print(f"{indent1}index_t idx_output = output_offset[tid];")
 
     # Now build the loop(s)
     lattice = build_lattice(expr)
@@ -168,7 +215,7 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
         if point.expr is None:
             return
         iters = get_sorted_args(point.expr)
-        terms = [f"(idx_{s} < end_{s})" for s in iters]
+        terms = [f"(idx_{s} <= end_{s})" for s in iters]
         while_cond = " && ".join(terms)
 
         print(f"\n{indent1}while({while_cond}) {{")
@@ -225,7 +272,7 @@ def compile(expr : Expr, func_name : str, compute : bool = True):
 
     if not compute:
         # TODO: this should be thread id
-        print(f"{indent1}nnzs[0] = nnz_count;")
+        print(f"{indent1}nnzs[tid] = nnz_count;")
 
     print("}")
 
@@ -236,25 +283,12 @@ if __name__ == "__main__":
     c = Vector("c")
 
     expr = a * b
-    compile(expr, "mul", False)
+    compile(expr, {"a"}, "mul_lb_a", False)
     print()
-    compile(expr, "mul", True)
-    print()
-
-    expr = a + b
-    compile(expr, "add", False)
-    print()
-    compile(expr, "add", True)
+    compile(expr, {"a"}, "mul_lb_a", True)
     print()
 
-    expr = (a + b) * c
-    compile(expr, "plus_mul", False)
+    compile(expr, {"a", "b"}, "mul_lb_ab", False)
     print()
-    compile(expr, "plus_mul", True)
-    print()
-
-    expr = (a * b) + c
-    compile(expr, "fma", False)
-    print()
-    compile(expr, "fma", True)
+    compile(expr, {"a", "b"}, "mul_lb_ab", True)
     print()
