@@ -126,8 +126,11 @@ def get_sorted_args(expr : Expr):
     vectors = sorted({v.name for v in edges})
     return vectors 
 
+
+
 # Vector expression to compile, and flag to enable compute or counting
 # lb is a list of the vectors to load balance with respect to
+# lb must be in the order that we expect to read from the partitions array
 def compile(expr : Expr, lb : List[str], func_name : str, compute : bool = True):
     vectors = get_sorted_args(expr)
 
@@ -141,7 +144,7 @@ def compile(expr : Expr, lb : List[str], func_name : str, compute : bool = True)
         func_name += "_precompute"
     print(f"void {func_name}(")
 
-    print(f"{indent1}const index_t *mergepath_partitions,")
+    print(f"{indent1}const index_t *partitions,")
     if compute:
         print(f"{indent1}const index_t *output_offset,")
 
@@ -168,41 +171,127 @@ def compile(expr : Expr, lb : List[str], func_name : str, compute : bool = True)
 
     # Now get bounds via load balancing.
 
-    # First upper bounds
-    count = 0
-    print(f"{indent1}index_t min_crd = (tid == 0) ? 0 : _{vectors[0]}.length;")
-    for vec in vectors:
-        if vec in lb:
-            # Lookup this vector's start point up in mergepath_partitions
-            # TODO: this copy's Atharva's code, but I think we can reorder
-            # the partitions array to make these loads better.
-            print(f"{indent1}idx_{vec} = mergepath_partitions[{count} * n_threads + tid];")
-            print(f"{indent1}min_crd = std::min(min_crd, _{vec}.indices[idx_{vec}]);")
-            count += 1
-    print()
+    def lower_bound(name, offset):
+        assert name in lb
+        if offset is None:
+            # Just read from register
+            return f"idx_{name}"
+        else:
+            # Need to read from `partitons`
+            i = lb.index(name)
+            return f"partitions[{i} * n_threads + (tid + {offset})]"
 
-    print()
+    def upper_bound(name, offset):
+        assert name in lb
+        if offset is None:
+            # Just read from register
+            return f"end_{name}"
+        else:
+            # Need to read from `partitons`
+            i = lb.index(name)
+            return f"partitions[{i} * n_threads + (tid + 1 + {offset})]"
 
-    # Now upper bounds
-    print(f"{indent1}index_t max_crd = (tid != (n_threads - 1)) ? 0 : _{vectors[0]}.length - 1;")
-    print(f"{indent1}if (tid != (n_threads - 1)) {{")
-    count = 0
-    for vec in vectors:
-        if vec in lb:
-            # Lookup this vector's end point up in mergepath_partitions
-            print(f"{indent2}end_{vec} = mergepath_partitions[{count} * n_threads + tid + 1];")
-            print(f"{indent2}max_crd = std::max(max_crd, _{vec}.indices[end_{vec}]);")
-            count += 1
-    print(f"{indent1}}}")
-    print()
+    # First, grab all bounds from
+    for (i, name) in enumerate(lb):
+        print(f"{indent1}idx_{name} = partitions[{i} * n_threads + tid];")
+        print(f"{indent1}end_{name} = partitions[{i} * n_threads + tid + 1];")
 
-    # Lookup ranges for non-load balanced vectors
-    for vec in vectors:
-        if vec not in lb:
-            # Binary search for this vector's start and end points
-            # TODO: might need clamping to 0 and nnz, respectively
-            print(f"{indent1}idx_{vec} = upper_bound(_{vec}, min_crd);")
-            print(f"{indent1}end_{vec} = lower_bound(_{vec}, max_crd);")
+    bounded = set(lb)
+
+    def min_bound(lb0, lb1):
+        if lb0 is None:
+            return lb1
+        elif lb1 is None:
+            return lb0
+        else:
+            return f"std::min({lb0}, {lb1})"
+    def max_bound(lb0, lb1):
+        if lb0 is None:
+            return lb1
+        elif lb1 is None:
+            return lb0
+        else:
+            return f"std::max({lb0}, {lb1})"
+
+    def get_coordinate_bounds(expr, wide):
+        match expr:
+            case Vector(name):
+                if name in bounded:
+                    lb = f"_{name}.indices[idx_{name}])"
+                    # For now, wide just takes the "rest" of the RHS chunk.
+                    wide_ub = f"_{name}.indices[std::min(end_{name} + 1, _{name}.nnz - 1)])"
+                    narrow_ub = f"_{name}.indices[end_{name}])"
+                    ub = wide_ub if wide else narrow_ub
+                    return lb, ub
+                else:
+                    return None, None
+            case Add(a, b):
+                a_lb, a_ub = get_coordinate_bounds(a, wide)
+                b_lb, b_ub = get_coordinate_bounds(b, wide)
+                if a_lb is None or a_ub is None or b_lb is None or b_ub is None:
+                    return None, None
+                # The bounds of an add are the union of bounds
+                return min_bound(a_lb, b_lb), max_bound(a_ub, b_ub)
+            case Mul(a, b):
+                a_lb, a_ub = get_coordinate_bounds(a, wide)
+                b_lb, b_ub = get_coordinate_bounds(b, wide)
+                # if (a_lb is None and b_lb is None) or (a_ub is None and b_ub is None):
+                if a_lb is None or a_ub is None or b_lb is None or b_ub is None:
+                    return None, None
+                # The bounds of a mul are the intersection of bounds
+                # BUT, if wide is true, we need the union of bounds!
+                if not wide:
+                    # intersection
+                    return max_bound(a_lb, b_lb), min_bound(a_ub, b_ub)
+                else:
+                    # union
+                    return min_bound(a_lb, b_lb), max_bound(a_ub, b_ub)
+            case _:
+                raise TypeError(f"Unexpected expression type: {type(e)}")
+
+    # Now, for any vector that is not load balanced, we need to *propagate* bounds.
+    def propagate_bounds(expr, lb, ub):
+        match expr:
+            case Vector(name):
+                if name not in bounded:
+                    assert lb is not None, f"Lower bound is None for vector '{name}'"
+                    assert ub is not None, f"Upper bound is None for vector '{name}'"
+                    print(f"{indent1}index_t crd_lb_{name} = {lb};")
+                    print(f"{indent1}index_t crd_ub_{name} = {ub};")
+                    print(f"{indent1}idx_{name} = (tid == 0) ? 0 : upper_bound({name}, crd_lb_{name});")
+                    print(f"{indent1}end_{name} = lower_bound({name}, crd_ub_{name});")
+                    bounded.add(name)
+            case Add(a, b):
+                a_lb, a_ub = get_coordinate_bounds(a, wide=True)
+                b_lb, b_ub = get_coordinate_bounds(b, wide=True)
+                # [lb, ub] is all we need, so clamp the union of
+                # a and b to those.
+                new_lb = max_bound(min_bound(a_lb, b_lb), lb)
+                new_ub = min_bound(max_bound(a_ub, b_ub), ub)
+                if a_lb is None or a_ub is None:
+                    # Propagate through a
+                    propagate_bounds(a, new_lb, new_ub)
+                if b_lb is None or b_ub is None:
+                    # Propagate through a
+                    propagate_bounds(b, new_lb, new_ub)
+            case Mul(a, b):
+                a_lb, a_ub = get_coordinate_bounds(a, wide=False)
+                b_lb, b_ub = get_coordinate_bounds(b, wide=False)
+                # [lb, ub] is all we need, so clamp the intersection
+                # of a and b to those.
+                new_lb = max_bound(max_bound(a_lb, b_lb), lb)
+                new_ub = min_bound(min_bound(a_ub, b_ub), ub)
+                if a_lb is None or a_ub is None:
+                    # Propagate through a
+                    propagate_bounds(a, new_lb, new_ub)
+                if b_lb is None or b_ub is None:
+                    # Propagate through a
+                    propagate_bounds(b, new_lb, new_ub)
+            case _:
+                raise TypeError(f"Unexpected expression type: {type(e)}")
+
+    propagate_bounds(expr, None, None)
+
     if compute:
         print(f"{indent1}index_t idx_output = output_offset[tid];")
 
@@ -280,19 +369,25 @@ if __name__ == "__main__":
     b = Vector("b")
     c = Vector("c")
 
-    expr = a * b
-    compile(expr, {"a"}, "mul_lb_a", False)
-    print()
-    compile(expr, {"a"}, "mul_lb_a", True)
-    print()
+    # expr = a * b
+    # compile(expr, ["a"], "mul_lb_a", False)
+    # print()
+    # compile(expr, ["a"], "mul_lb_a", True)
+    # print()
 
-    compile(expr, {"a", "b"}, "mul_lb_ab", False)
-    print()
-    compile(expr, {"a", "b"}, "mul_lb_ab", True)
-    print()
+    # compile(expr, ["a", "b"], "mul_lb_ab", False)
+    # print()
+    # compile(expr, ["a", "b"], "mul_lb_ab", True)
+    # print()
 
-    expr = a + b
-    compile(expr, {"a"}, "add_lb_a", False)
+    # expr = a + b
+    # compile(expr, ["a"], "add_lb_a", False)
+    # print()
+    # compile(expr, ["a"], "add_lb_a", True)
+    # print()
+
+    expr = a + b * c
+    compile(expr, ["b", "c"], "a_bc", False)
     print()
-    compile(expr, {"a"}, "add_lb_a", True)
+    compile(expr, ["b", "c"], "a_bc", True)
     print()
