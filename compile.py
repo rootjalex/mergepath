@@ -217,10 +217,10 @@ def compile(expr : Expr, lb : List[str], func_name : str, compute : bool = True)
         match expr:
             case Vector(name):
                 if name in bounded:
-                    lb = f"_{name}.indices[idx_{name}])"
+                    lb = f"_{name}.indices[idx_{name}]"
                     # For now, wide just takes the "rest" of the RHS chunk.
-                    wide_ub = f"_{name}.indices[std::min(end_{name} + 1, _{name}.nnz - 1)])"
-                    narrow_ub = f"_{name}.indices[end_{name}])"
+                    wide_ub = f"_{name}.indices[std::min(end_{name} + 1, _{name}.nnz - 1)]"
+                    narrow_ub = f"_{name}.indices[end_{name}]"
                     ub = wide_ub if wide else narrow_ub
                     return lb, ub
                 else:
@@ -390,4 +390,11 @@ if __name__ == "__main__":
     compile(expr, ["b", "c"], "a_bc", False)
     print()
     compile(expr, ["b", "c"], "a_bc", True)
+    print()
+
+
+    expr = (a + b) * c
+    compile(expr, ["b", "c"], "ab_c", False)
+    print()
+    compile(expr, ["b", "c"], "ab_c", True)
     print()
